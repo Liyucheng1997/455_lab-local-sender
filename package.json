@@ -1,0 +1,16 @@
+{
+  "name": "web-localsend",
+  "version": "1.0.0",
+  "description": "网页快传：同一局域网下打开网页即可互相发现、拖拽互传文件（WebRTC 点对点，失败时经服务器中转）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

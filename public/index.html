@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>网页快传</title>
+  <meta name="description" content="同一局域网下打开网页即可互相发现，拖拽互传文件和文字，无需安装、无需登录。">
+  <meta name="theme-color" content="#f5f5f7">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="tokens.css">
+  <link rel="stylesheet" href="style.css">
+  <script>
+    try {
+      var t = localStorage.getItem('ls.theme');
+      t = t ? JSON.parse(t) : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      document.documentElement.dataset.theme = t;
+    } catch (e) {}
+  </script>
+</head>
+<body>
+  <div id="app">
+    <header class="titlebar">
+      <div class="brand">
+        <div class="logo-mark" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h13l-4-4"/><path d="M20 16H7l4 4"/></svg>
+        </div>
+        <div>
+          <div class="brand-name">网页快传</div>
+          <div class="brand-sub">同一网络 · 打开即用</div>
+        </div>
+      </div>
+      <div class="spacer"></div>
+      <span id="conn" class="status"><i></i><span>连接中…</span></span>
+      <button class="tb-round" id="btnRoom" title="配对码（跨网络连接）"></button>
+      <button class="tb-round" id="btnTheme" title="切换深色模式"></button>
+    </header>
+
+    <main class="main">
+      <section class="stage">
+        <div class="stage-head">
+          <div class="eyebrow">NEARBY</div>
+          <h1>附近的设备</h1>
+          <p class="lead">把文件拖到设备上即可发送；也可以点设备选文件，或直接 <kbd>Ctrl</kbd>+<kbd>V</kbd> 粘贴。</p>
+        </div>
+
+        <div id="peers" class="peers"></div>
+
+        <div id="empty" class="empty">
+          <div class="radar" aria-hidden="true"><span></span><span></span><span></span><div class="radar-core"></div></div>
+          <div class="empty-title">正在寻找同一网络下的设备…</div>
+          <div class="empty-text">在另一台电脑或手机上打开这个网址，两边就能互相看到</div>
+          <button class="url-pill" id="btnCopyUrl" title="复制网址"><span id="pageUrl"></span><span class="url-copy"></span></button>
+          <div class="empty-hint">看不到对方？可能两台设备不在同一出口网络，用右上角的<b>配对码</b>连接</div>
+        </div>
+
+        <div class="me">
+          <div class="me-pill">
+            <span class="me-ico" id="meIco"></span>
+            <span class="me-label">我的设备</span>
+            <button id="myName" class="me-name" title="点击改名"></button>
+            <span id="room" class="room-tag" hidden></span>
+          </div>
+        </div>
+      </section>
+
+      <aside class="side">
+        <div class="side-head">
+          <div>
+            <div class="card-title">传输记录</div>
+            <div class="side-sub">仅保存在当前网页，刷新后清空</div>
+          </div>
+          <button class="btn btn-sm" id="btnClear">清空</button>
+        </div>
+        <div class="side-opts">
+          <label class="form-check"><input type="checkbox" id="optAuto"> 自动接收文件（不再询问）</label>
+        </div>
+        <div id="log" class="log">
+          <div class="log-empty" id="logEmpty">收到的文件和文字会显示在这里</div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <input type="file" id="filePick" multiple hidden>
+  <div id="dropMask" class="drop-mask" hidden><div class="drop-card"><div class="drop-ico"></div><div id="dropText">松开即可发送</div></div></div>
+  <div class="toast-host" id="toasts"></div>
+  <script src="app.js"></script>
+</body>
+</html>
