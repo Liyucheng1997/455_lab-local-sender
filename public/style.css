@@ -43,6 +43,7 @@ kbd { font-family: var(--font); font-size: 12px; padding: 1px 6px; border-radius
 .ring .track { stroke: transparent; }
 .ring .bar { stroke: var(--primary); stroke-linecap: round; transition: stroke-dashoffset .2s linear; }
 .peer.busy .ring .track { stroke: var(--fill); }
+.peer.away .peer-ava, .peer.away .peer-name, .peer.away .peer-dev { opacity: .45; transition: opacity .3s; }
 .peer-name { font-size: 16px; font-weight: 600; letter-spacing: -0.02em; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .peer-dev { font-size: 12.5px; color: var(--text-3); margin-top: 3px; }
 .peer-state { display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 12.5px; font-weight: 500; color: var(--text-2); min-height: 18px; font-variant-numeric: tabular-nums; }

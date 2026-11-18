@@ -10,8 +10,9 @@
 // ---------- 常量与工具 ----------
 const CHUNK = 64 * 1024;
 const READ_BLOCK = 2 * 1024 * 1024;
-const ACK_EVERY = 1024 * 1024;
-const P2P_WAIT = 6000;
+const ACK_EVERY = 256 * 1024;
+const P2P_WAIT = 6000; // 发送前最多等直连这么久
+const P2P_GIVEUP = 15000; // 一次直连尝试的期限，超过就记为失败、稍后重试
 
 const $ = (s, el = document) => el.querySelector(s);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -81,49 +82,97 @@ const devIcon = (d) => (d && d.type === 'phone' ? 'phone' : d && d.type === 'tab
 const devText = (d) => [d && d.os, d && d.browser].filter(Boolean).join(' · ') || '未知设备';
 
 // ---------- 服务器连接 ----------
+// 与服务器的连接随时可能断（跨境线路、手机切到后台、换网络）。断了就立刻重连，并带上原来的 id + token，
+// 服务器会把我们认回同一台设备：对方看到的还是同一张卡片，正在传的文件接着传，已建好的直连不受影响。
 let ws = null;
 let wsRetry = 0;
+let wsTimer = null;
+let lastRx = 0;
+let pingAt = 0;
+let justJoined = false;
 let iceServers = [{ urls: 'stun:stun.miwifi.com:3478' }, { urls: 'stun:stun.l.google.com:19302' }];
 let relayAllowed = true;
 const peers = new Map();
 
+const wsUp = () => !!ws && !ws.dead && ws.readyState === 1;
 function wsSend(obj) {
-  if (ws && ws.readyState === 1) { ws.send(JSON.stringify(obj)); return true; }
+  if (wsUp()) { ws.send(JSON.stringify(obj)); return true; }
   return false;
 }
 function signal(to, data) { wsSend({ type: 'signal', to, data }); }
+// 链路类错误：传输中遇到它不算失败，等链路恢复后续传
+function linkErr(msg) { const e = new Error(msg); e.link = true; return e; }
 
 function connectServer() {
+  clearTimeout(wsTimer);
+  if (ws && !ws.dead && ws.readyState <= 1) return;
   setConn('wait');
-  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = () => {
-    wsRetry = 0;
-    wsSend({ type: 'join', key: me.key, name: me.name, device: me.device, room: me.room });
+  const sock = (ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`));
+  sock.binaryType = 'arraybuffer';
+  sock.onopen = () => {
+    lastRx = Date.now();
+    sock.send(JSON.stringify({
+      type: 'join', key: me.key, name: me.name, device: me.device, room: me.room,
+      resume: me.id ? { id: me.id, token: me.token } : undefined,
+    }));
   };
-  ws.onmessage = (e) => {
+  sock.onmessage = (e) => {
+    if (sock !== ws) return;
+    lastRx = Date.now();
     if (typeof e.data !== 'string') return onRelayBinary(e.data);
     let m;
     try { m = JSON.parse(e.data); } catch { return; }
     if (m.type === 'welcome') {
+      // 离线太久、或服务器重启过：身份已失效，之前的设备列表全部作废
+      if (me.id && me.id !== m.id) dropPeers('连接已重置');
       me.id = m.id;
+      me.token = m.token;
+      wsRetry = 0;
+      justJoined = true;
       if (Array.isArray(m.iceServers) && m.iceServers.length) iceServers = m.iceServers;
       relayAllowed = m.relay !== false;
       setConn('ok');
-    } else if (m.type === 'peers') updatePeers(m.peers || []);
-    else if (m.type === 'signal') peers.get(m.from)?.onSignal(m.data || {});
-    else if (m.type === 'relay') peers.get(m.from)?.onMsg(m.data || {});
+    } else if (m.type === 'peers') {
+      updatePeers(m.peers || []);
+      if (justJoined) { justJoined = false; for (const p of peers.values()) p.recover(); }
+    } else if (m.type === 'signal') peers.get(m.from)?.onSignal(m.data || {});
+    else if (m.type === 'relay') peers.get(m.from)?.onMsg(m.data || {}, 'relay');
   };
-  ws.onclose = () => {
-    me.id = null;
+  sock.onclose = () => {
+    if (sock.dead) return;
+    sock.dead = true;
+    if (sock !== ws) return;
     setConn('bad');
-    for (const p of [...peers.values()]) p.destroy('服务器连接断开');
-    peers.clear();
-    renderEmpty();
-    setTimeout(connectServer, Math.min(1000 * 2 ** wsRetry++, 10000));
+    for (const p of peers.values()) p.paint();
+    wsTimer = setTimeout(connectServer, wsRetry ? Math.min(600 * 2 ** wsRetry, 5000) : 300);
+    wsRetry++;
   };
 }
-setInterval(() => wsSend({ type: 'ping' }), 25000);
+// 连接看着还在、其实已经不通（半开）时，不等系统超时，直接弃掉重连
+function kickWs() {
+  const s = ws;
+  if (!s || s.dead) return;
+  try { s.close(); } catch {}
+  s.onclose();
+}
+setInterval(() => {
+  if (!wsUp()) return;
+  if (pingAt > lastRx && Date.now() - pingAt > 30000) return kickWs();
+  if (pingAt <= lastRx) { pingAt = Date.now(); wsSend({ type: 'ping' }); }
+}, 15000);
+// 回到页面、网络恢复时马上检查一次，而不是等下一轮定时器（后台页面的定时器会被浏览器大幅放慢）
+function wakeUp() {
+  if (!ws || ws.dead || ws.readyState > 1) { wsRetry = 0; connectServer(); return; }
+  if (ws.readyState !== 1) return;
+  const at = (pingAt = Date.now());
+  wsSend({ type: 'ping' });
+  setTimeout(() => { if (lastRx < at && pingAt === at) kickWs(); }, 5000);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { wakeUp(); syncWakeLock(); } });
+window.addEventListener('online', wakeUp);
+window.addEventListener('pageshow', (e) => { if (e.persisted) wakeUp(); });
+// 真正关闭/刷新页面时告诉服务器，对方那边立刻消失，不用等掉线宽限期
+window.addEventListener('pagehide', () => { wsSend({ type: 'leave' }); });
 
 // 中转二进制帧：[1 字节 id 长度][id][数据]
 function relaySendBin(to, u8) {
@@ -138,7 +187,7 @@ function onRelayBinary(buf) {
   const u8 = new Uint8Array(buf);
   const n = u8[0];
   const from = new TextDecoder().decode(u8.subarray(1, 1 + n));
-  peers.get(from)?.onBin(buf.slice(1 + n));
+  peers.get(from)?.onBin(buf.slice(1 + n), 'relay');
 }
 
 function updatePeers(list) {
@@ -146,11 +195,42 @@ function updatePeers(list) {
   for (const info of list) {
     seen.add(info.id);
     const p = peers.get(info.id);
-    if (p) { p.info = info; p.paint(); }
+    if (p) p.update(info);
     else peers.set(info.id, new Peer(info));
   }
   for (const [id, p] of peers) if (!seen.has(id)) { p.destroy('对方已离开'); peers.delete(id); }
   renderEmpty();
+}
+function dropPeers(reason) {
+  for (const p of [...peers.values()]) p.destroy(reason);
+  peers.clear();
+  renderEmpty();
+}
+
+// 传输时保持屏幕常亮：手机一锁屏，浏览器就会掐掉网络
+let wakeLock = null;
+async function syncWakeLock() {
+  const need = [...peers.values()].some((p) => p.out || p.inc);
+  if (need && !wakeLock && !document.hidden && navigator.wakeLock) {
+    try {
+      const l = (wakeLock = await navigator.wakeLock.request('screen'));
+      l.addEventListener('release', () => { if (wakeLock === l) wakeLock = null; });
+    } catch {}
+  } else if (!need && wakeLock) {
+    const l = wakeLock;
+    wakeLock = null;
+    l.release().catch(() => {});
+  }
+}
+
+// 解析 ICE 候选地址，只取类型和地址族，用于判断“为什么连不上”
+function candInfo(s) {
+  const p = String(s || '').split(' ');
+  const k = p.indexOf('typ');
+  if (k < 0 || p.length < 8) return null;
+  const ip = p[4] || '';
+  const fam = ip.endsWith('.local') ? 'm' : ip.includes(':') ? 6 : 4;
+  return { type: p[k + 1], fam, port: p[5], kind: p[k + 1] + fam + (p[2].toLowerCase() === 'tcp' ? 't' : '') };
 }
 
 // ---------- 对等设备 ----------
@@ -160,6 +240,7 @@ class Peer {
     this.id = info.id;
     this.pc = null;
     this.dc = null;
+    this.pcN = '';
     this.iceQueue = [];
     this.queue = [];
     this.busy = false;
@@ -167,89 +248,186 @@ class Peer {
     this.inc = null; // 正在接收
     this.waiters = new Map(); // tid -> resolve
     this.openWaiters = [];
+    this.doneTids = new Set();
     this.connectStarted = 0;
+    this.p2pTries = 0;
+    this.p2pTimer = null;
+    this.p2pHint = '';
     this.el = this.render();
     this.connectP2P();
   }
   get name() { return this.info.name || '设备'; }
+  get away() { return !!this.info.away; }
+  get initiator() { return me.id < this.id; }
   get p2p() { return !!this.dc && this.dc.readyState === 'open'; }
   get mode() { return this.p2p ? 'p2p' : 'relay'; }
 
+  update(info) {
+    const back = this.info.away && !info.away;
+    this.info = info;
+    if (back) {
+      this.recover();
+      if (!this.p2p && Date.now() - this.connectStarted > 8000) { this.p2pTries = 0; this.connectP2P(true); }
+    }
+    this.paint();
+  }
+
   // --- WebRTC ---
+  // id 小的一方发起；另一方只发 want 请求对方发起。每次尝试带一个编号 n，旧尝试迟到的应答/候选一律丢弃。
   connectP2P(restart = false) {
-    if (!me.id || typeof RTCPeerConnection === 'undefined') return;
+    if (!this.el || typeof RTCPeerConnection === 'undefined') return;
     if (this.pc && !restart) return;
+    clearTimeout(this.p2pTimer);
+    if (!wsUp() || this.away) { this.p2pTimer = setTimeout(() => this.connectP2P(restart), 5000); return; }
     this.connectStarted = Date.now();
-    if (me.id < this.id) { this.resetPC(); this.makePC(true); }
+    if (this.initiator) { this.resetPC(); this.makePC(true, rid(4)); }
     else signal(this.id, { want: 1, restart });
+    this.p2pTimer = setTimeout(() => this.p2pCheck(), P2P_GIVEUP);
     this.paintSoon();
     setTimeout(() => this.paint(), P2P_WAIT + 100);
   }
-  makePC(initiator) {
+  // 一段时间还没连上：记一次失败，之后在后台按 4 秒、20 秒、1 分钟、每 3 分钟 重试；连上后的传输自动改走直连
+  p2pCheck() {
+    if (!this.el) return;
+    if (this.p2p) { this.p2pTries = 0; return; }
+    if (this.pc) this.report(this.pc, false);
+    const delay = [4000, 20000, 60000][this.p2pTries++] ?? 180000;
+    this.p2pTimer = setTimeout(() => { if (!this.p2p) this.connectP2P(true); }, delay);
+    this.paint();
+  }
+  makePC(initiator, n) {
     const pc = (this.pc = new RTCPeerConnection({ iceServers }));
-    pc.onicecandidate = (e) => { if (e.candidate) signal(this.id, { ice: e.candidate }); };
+    this.pcN = n;
+    this.iceQueue = [];
+    pc.st = { loc: new Set(), rem: new Set(), ports: new Set(), reported: false };
+    pc.onicecandidate = (e) => {
+      if (!e.candidate) return;
+      const c = candInfo(e.candidate.candidate);
+      if (c) { pc.st.loc.add(c.kind); if (c.type === 'srflx' && c.fam === 4) pc.st.ports.add(c.port); }
+      signal(this.id, { ice: e.candidate, n });
+    };
     pc.onconnectionstatechange = () => {
-      if (this.pc === pc && (pc.connectionState === 'failed' || pc.connectionState === 'closed')) this.resetPC();
+      if (this.pc !== pc) return;
+      const s = pc.connectionState;
+      clearTimeout(pc.dcTimer);
+      if (s === 'failed' || s === 'closed') this.p2pDown(pc);
+      else if (s === 'disconnected') pc.dcTimer = setTimeout(() => { if (this.pc === pc && pc.connectionState === 'disconnected') this.p2pDown(pc); }, 6000);
       this.paintSoon();
     };
     if (initiator) {
-      this.bindDC(pc.createDataChannel('ls', { ordered: true }));
+      this.bindDC(pc.createDataChannel('ls', { ordered: true }), pc);
       pc.createOffer()
         .then((o) => pc.setLocalDescription(o))
-        .then(() => signal(this.id, { sdp: pc.localDescription }))
+        .then(() => { if (this.pc === pc) signal(this.id, { sdp: pc.localDescription, n }); })
         .catch((e) => console.warn('offer', e));
     } else {
-      pc.ondatachannel = (e) => this.bindDC(e.channel);
+      pc.ondatachannel = (e) => this.bindDC(e.channel, pc);
     }
     return pc;
   }
-  bindDC(dc) {
+  bindDC(dc, pc) {
     dc.binaryType = 'arraybuffer';
     dc.bufferedAmountLowThreshold = 1 << 20;
     dc.onopen = () => {
+      if (this.pc !== pc) return;
       this.dc = dc;
+      this.p2pTries = 0;
+      this.p2pHint = '';
       this.openWaiters.splice(0).forEach((r) => r(true));
+      this.report(pc, true);
+      if (this.out?.hold) this.askResume();
+      if (this.inc?.paused) this.sendRp();
       this.paintSoon();
     };
-    dc.onclose = () => { if (this.dc === dc) this.dc = null; this.paintSoon(); };
+    dc.onclose = () => { if (this.dc === dc && this.pc === pc) this.p2pDown(pc); this.paintSoon(); };
     dc.onbufferedamountlow = () => this.out?.wake?.();
-    dc.onmessage = (e) => (typeof e.data === 'string' ? this.onMsg(JSON.parse(e.data)) : this.onBin(e.data));
+    dc.onmessage = (e) => {
+      if (this.dc !== dc) return;
+      if (typeof e.data !== 'string') return this.onBin(e.data, 'p2p');
+      let m;
+      try { m = JSON.parse(e.data); } catch { return; }
+      this.onMsg(m, 'p2p');
+    };
     this.dc = dc;
   }
   resetPC() {
     const pc = this.pc;
     this.pc = null;
     this.dc = null;
-    if (pc) try { pc.close(); } catch {}
+    if (pc) { clearTimeout(pc.dcTimer); try { pc.close(); } catch {} }
+  }
+  // 直连断了（或没连上就失败了）：正在传的改走中转续传，并在后台重新尝试直连
+  p2pDown(pc) {
+    const was = !!this.dc && this.pc === pc && pc.st.reported;
+    if (!was) this.report(pc, false);
+    this.resetPC();
+    this.recover();
+    if (was) {
+      this.p2pTries = 0;
+      clearTimeout(this.p2pTimer);
+      this.p2pTimer = setTimeout(() => this.connectP2P(true), 1500);
+    }
+    this.paint();
+  }
+  // 把直连结果报给服务器写日志（候选地址类型、NAT 类型、耗时），方便事后排查
+  async report(pc, ok) {
+    const st = pc.st;
+    if (!st || st.reported) return;
+    st.reported = true;
+    const nat = st.ports.size > 1 ? 'symmetric' : st.ports.size ? 'cone' : 'no-srflx';
+    const d = { nat, loc: [...st.loc].sort().join(','), rem: [...st.rem].sort().join(','), ice: pc.iceConnectionState, ms: Date.now() - this.connectStarted, tries: this.p2pTries };
+    if (ok) {
+      try {
+        const stats = await pc.getStats();
+        stats.forEach((r) => {
+          if (r.type !== 'candidate-pair' || !r.nominated || r.state !== 'succeeded') return;
+          const l = stats.get(r.localCandidateId), m = stats.get(r.remoteCandidateId);
+          if (l && m) d.pair = `${l.candidateType}/${l.protocol}→${m.candidateType} ${String(l.address || l.ip || '').includes(':') ? 'v6' : 'v4'}`;
+        });
+      } catch {}
+    } else {
+      this.p2pHint = nat === 'symmetric' ? '本机网络是对称型 NAT（手机流量、部分宽带常见），打洞不成功，已自动走服务器中转'
+        : !st.rem.size ? '没有收到对方的网络地址，已自动走服务器中转，会在后台继续尝试直连'
+        : '双方网络之间打洞不成功，已自动走服务器中转，会在后台继续尝试直连';
+    }
+    wsSend({ type: 'diag', to: this.id, ev: ok ? 'p2p-ok' : 'p2p-fail', d });
   }
   async onSignal(d) {
     try {
       if (d.want) {
-        if (me.id < this.id && (!this.pc || d.restart)) { this.connectStarted = Date.now(); this.resetPC(); this.makePC(true); }
+        if (!this.initiator) return;
+        const trying = this.pc && this.pc.connectionState !== 'failed' && Date.now() - this.connectStarted < 8000;
+        if (!this.pc || (d.restart && !trying && !this.p2p)) this.connectP2P(true);
         return;
       }
       if (d.sdp && d.sdp.type === 'offer') {
         this.resetPC();
         this.connectStarted = Date.now();
-        const pc = this.makePC(false);
+        clearTimeout(this.p2pTimer);
+        this.p2pTimer = setTimeout(() => this.p2pCheck(), P2P_GIVEUP);
+        const pc = this.makePC(false, d.n);
         await pc.setRemoteDescription(d.sdp);
         await pc.setLocalDescription(await pc.createAnswer());
-        signal(this.id, { sdp: pc.localDescription });
+        if (this.pc !== pc) return;
+        signal(this.id, { sdp: pc.localDescription, n: d.n });
         this.flushIce();
       } else if (d.sdp && d.sdp.type === 'answer') {
-        if (this.pc && this.pc.signalingState === 'have-local-offer') {
+        if (this.pc && d.n === this.pcN && this.pc.signalingState === 'have-local-offer') {
           await this.pc.setRemoteDescription(d.sdp);
           this.flushIce();
         }
       } else if (d.ice) {
-        if (this.pc && this.pc.remoteDescription) await this.pc.addIceCandidate(d.ice).catch(() => {});
+        if (!this.pc || d.n !== this.pcN) return;
+        const c = candInfo(d.ice.candidate);
+        if (c) this.pc.st.rem.add(c.kind);
+        if (this.pc.remoteDescription) await this.pc.addIceCandidate(d.ice).catch(() => {});
         else this.iceQueue.push(d.ice);
       }
     } catch (e) { console.warn('signal', e); }
   }
   flushIce() {
     const q = this.iceQueue.splice(0);
-    for (const c of q) this.pc.addIceCandidate(c).catch(() => {});
+    for (const c of q) this.pc?.addIceCandidate(c).catch(() => {});
   }
   waitOpen(ms) {
     if (this.p2p) return Promise.resolve(true);
@@ -258,12 +436,11 @@ class Peer {
       setTimeout(() => res(this.p2p), ms);
     });
   }
+  // 发送前选链路：直连好了就用直连；正在连就等一小会儿；之前已经确认连不上的，不再让用户干等，直接中转
   async ensureLink() {
     if (this.p2p) return 'p2p';
-    const st = this.pc && this.pc.connectionState;
-    const fresh = this.pc && Date.now() - this.connectStarted < P2P_WAIT && st !== 'failed';
-    if (!fresh) this.connectP2P(true);
-    await this.waitOpen(Math.max(1500, P2P_WAIT - (Date.now() - this.connectStarted)));
+    const left = P2P_WAIT - (Date.now() - this.connectStarted);
+    if (this.pc && this.pc.connectionState !== 'failed' && left > 0) await this.waitOpen(left);
     if (this.p2p) return 'p2p';
     if (!relayAllowed) throw new Error('无法直连，且服务器未开启中转');
     return 'relay';
@@ -272,36 +449,88 @@ class Peer {
   // --- 发送原语 ---
   sendMsg(obj, mode = this.mode) {
     if (mode === 'p2p') {
-      if (!this.p2p) throw new Error('直连已断开');
+      if (!this.p2p) throw linkErr('直连已断开');
       this.dc.send(JSON.stringify(obj));
-    } else if (!wsSend({ type: 'relay', to: this.id, data: obj })) throw new Error('服务器连接已断开');
+    } else if (!wsSend({ type: 'relay', to: this.id, data: obj })) throw linkErr('服务器连接已断开');
   }
   sendBin(u8, mode) {
     if (mode === 'p2p') {
-      if (!this.p2p) throw new Error('直连已断开');
+      if (!this.p2p) throw linkErr('直连已断开');
       this.dc.send(u8);
     } else {
-      if (!ws || ws.readyState !== 1) throw new Error('服务器连接已断开');
+      if (!wsUp()) throw linkErr('服务器连接已断开');
       relaySendBin(this.id, u8);
     }
   }
+  // 等到可以继续写：链路断了不报错，原地等它恢复（恢复后由 recover → 续传握手把进度对齐）
   async waitWritable(t) {
     for (;;) {
       if (t.cancelled) throw new Error(t.cancelReason || '已取消');
-      let buffered, limit, win;
-      if (t.mode === 'p2p') {
-        if (!this.p2p) throw new Error('直连已断开');
-        buffered = this.dc.bufferedAmount; limit = 8 << 20; win = 32 << 20;
-      } else {
-        if (!ws || ws.readyState !== 1) throw new Error('服务器连接已断开');
-        buffered = ws.bufferedAmount; limit = 2 << 20; win = 6 << 20;
+      if (t.rewind) return;
+      if (!t.hold) {
+        if (t.mode === 'p2p') {
+          if (!this.p2p) this.startHold(t);
+          else if (this.dc.bufferedAmount < 8 << 20 && t.sent - t.acked < 32 << 20) return;
+        } else if (wsUp() && !this.away) {
+          if (ws.bufferedAmount < 2 << 20 && t.sent - t.acked < 6 << 20) return;
+        }
       }
-      if (buffered < limit && t.sent - t.acked < win) return;
-      await Promise.race([new Promise((r) => (t.wake = r)), sleep(40)]);
+      await Promise.race([new Promise((r) => (t.wake = r)), sleep(t.hold ? 250 : 40)]);
     }
   }
   waitReply(tid) { return new Promise((r) => this.waiters.set(tid, r)); }
   reply(tid, v) { const r = this.waiters.get(tid); if (r) { this.waiters.delete(tid); r(v); } }
+
+  // --- 断线恢复 ---
+  // 续传握手：发送方 rs（问：你收到哪了）→ 接收方暂停收数据并回 rp{第 i 个文件, 已收 got 字节, 编号 n}
+  //          → 发送方从该位置重发，以 fh{i, off, n} 开头 → 接收方见到编号对得上的 fh 才恢复接收。
+  // 握手期间路上的旧数据块全部丢弃，所以不会重复也不会错位；换链路（直连 ↔ 中转）也走同一套。
+  recover() {
+    if (!this.el) return;
+    const t = this.out;
+    if (t && t.phase === 'wait') { try { this.sendMsg(t.req); } catch {} }
+    else if (t && t.phase !== 'link' && !(t.mode === 'p2p' && this.p2p)) {
+      if (t.hold) this.askResume(); else this.startHold(t);
+    }
+    const inc = this.inc;
+    if (inc && !(inc.via === 'p2p' && this.p2p)) this.offerResume(false);
+    this.paint();
+  }
+  startHold(t) {
+    if (t.hold) return;
+    t.hold = true;
+    t.k++;
+    this.askResume();
+    t.wake?.();
+    this.paintSoon();
+  }
+  askResume() {
+    const t = this.out;
+    if (!t || !t.hold) return;
+    try { this.sendMsg({ t: 'rs', tid: t.tid, k: t.k }); } catch {}
+    clearTimeout(t.rsTimer);
+    t.rsTimer = setTimeout(() => { if (this.out === t) this.askResume(); }, 4000);
+  }
+  // 发送方看门狗：长时间没有任何确认（数据在某处被悄悄丢了），主动对一次进度
+  watch(t) {
+    if (this.out !== t || t.hold || t.cancelled || this.away) return;
+    if (Date.now() - t.ackAt > 30000 && (t.phase === 'finish' || t.sent > t.acked)) { t.ackAt = Date.now(); this.startHold(t); }
+  }
+  offerResume(fresh) {
+    const inc = this.inc;
+    if (!inc) return;
+    if (fresh || !inc.paused) { inc.paused = true; inc.n++; }
+    this.sendRp();
+    this.paintSoon();
+  }
+  sendRp() {
+    const inc = this.inc;
+    if (!inc || !inc.paused) return;
+    const cur = inc.cur;
+    try { this.sendMsg({ t: 'rp', tid: inc.tid, n: inc.n, i: cur ? cur.i : inc.next, got: cur ? cur.got : 0 }); } catch {}
+    clearTimeout(inc.rpTimer);
+    inc.rpTimer = setTimeout(() => { if (this.inc === inc) this.sendRp(); }, 4000);
+  }
 
   // --- 发送文件 ---
   sendFiles(fileList) {
@@ -324,13 +553,14 @@ class Peer {
   async doSend(files) {
     const tid = rid(6);
     const total = files.reduce((s, f) => s + f.size, 0);
-    const t = (this.out = { tid, files, total, sent: 0, acked: 0, cancelled: false, phase: 'link', start: 0 });
+    const t = (this.out = { tid, files, total, sent: 0, acked: 0, cancelled: false, phase: 'link', start: 0, hold: false, rewind: null, rpN: 0, k: 0, ackAt: 0 });
     this.paint();
     t.mode = await this.ensureLink();
     if (t.cancelled) throw new Error('已取消');
     t.phase = 'wait';
     this.paint();
-    this.sendMsg({ t: 'req', tid, total, files: files.map((f) => ({ name: f.name, size: f.size, type: f.type })) }, t.mode);
+    t.req = { t: 'req', tid, total, files: files.map((f) => ({ name: f.name, size: f.size, type: f.type })) };
+    try { this.sendMsg(t.req); } catch {} // 恰好断线也没关系：链路恢复时 recover() 会重发
     const ans = await this.waitReply(tid);
     if (ans === 'rej') { toast(`${this.name} 拒绝了文件`, 'error'); return; }
     if (ans === 'busy') { toast(`${this.name} 正在接收其他文件，请稍后再试`, 'error'); return; }
@@ -340,30 +570,62 @@ class Peer {
     else throw new Error('直连已断开');
     t.phase = 'send';
     t.start = performance.now();
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i];
-      this.sendMsg({ t: 'fh', tid, i }, t.mode);
-      for (let off = 0; off < f.size;) {
-        const block = new Uint8Array(await f.slice(off, off + READ_BLOCK).arrayBuffer());
-        if (!block.length) throw new Error(`读取文件失败：${f.name}`);
-        for (let p = 0; p < block.length; p += CHUNK) {
-          await this.waitWritable(t);
-          const c = block.subarray(p, p + CHUNK);
-          this.sendBin(c, t.mode);
-          t.sent += c.length;
-        }
-        off += block.length;
-        this.paintSoon();
-      }
-      this.sendMsg({ t: 'fe', tid, i }, t.mode);
-    }
-    t.phase = 'finish';
-    this.paint();
-    const done = await this.waitReply(tid);
-    if (done !== 'done') throw new Error(t.cancelReason || '已取消');
+    t.ackAt = Date.now();
+    const dog = setInterval(() => this.watch(t), 5000);
+    try { await this.pump(t); }
+    finally { clearInterval(dog); clearTimeout(t.rsTimer); }
     const secs = (performance.now() - t.start) / 1000;
     toast(`已发送给 ${this.name}（${fmtSize(total)}${secs > 1 ? '，' + fmtSize(total / secs) + '/s' : ''}）`, 'success');
     for (const f of files) logItem({ dir: 'out', kind: 'file', name: f.name, size: f.size, peer: this.name, mode: t.mode });
+  }
+  // 发送循环：位置 (i, off) 随时可以被接收方的 rp 拨回去（t.rewind），所以断线、换链路都只是“从对方说的位置接着发”
+  async pump(t) {
+    const { files, tid } = t;
+    const before = [0];
+    for (const f of files) before.push(before[before.length - 1] + f.size);
+    let i = 0, off = 0, head = true, n, block = null, blockAt = 0, blockOf = -1;
+    for (;;) {
+      await this.waitWritable(t);
+      if (t.rewind) {
+        ({ i, off, n } = t.rewind);
+        t.rewind = null;
+        t.sent = t.acked = before[i] + off;
+        t.mode = this.p2p ? 'p2p' : 'relay';
+        t.phase = 'send';
+        head = true;
+        this.paintSoon();
+        continue;
+      }
+      try {
+        if (i >= files.length) {
+          t.phase = 'finish';
+          this.paint();
+          const r = await this.waitReply(tid);
+          if (r === 'done') return;
+          if (r === 'rewind') continue;
+          throw new Error(t.cancelReason || '已取消');
+        }
+        const f = files[i];
+        if (head) { this.sendMsg({ t: 'fh', tid, i, off, n }, t.mode); head = false; n = undefined; }
+        if (off >= f.size) { this.sendMsg({ t: 'fe', tid, i }, t.mode); i++; off = 0; head = true; continue; }
+        if (blockOf !== i || off < blockAt || off >= blockAt + block.length) {
+          const at = off, of = i;
+          const b = new Uint8Array(await f.slice(at, at + READ_BLOCK).arrayBuffer());
+          if (!b.length) throw new Error(`读取文件失败：${f.name}`);
+          block = b; blockAt = at; blockOf = of;
+          if (t.rewind || t.hold || t.cancelled) continue;
+        }
+        const p = off - blockAt;
+        const c = block.subarray(p, p + CHUNK);
+        this.sendBin(c, t.mode);
+        off += c.length;
+        t.sent += c.length;
+        this.paintSoon();
+      } catch (e) {
+        if (!e.link || t.cancelled) throw e;
+        this.startHold(t);
+      }
+    }
   }
   cancel() {
     const t = this.out;
@@ -380,6 +642,7 @@ class Peer {
   async sendText(text) {
     try {
       const mode = await this.ensureLink();
+      if (mode === 'relay' && this.away) throw new Error('对方暂时掉线，等它重连后再发');
       this.sendMsg({ t: 'text', text }, mode);
       logItem({ dir: 'out', kind: 'text', text, peer: this.name });
       toast(`文字已发送给 ${this.name}`, 'success');
@@ -387,14 +650,47 @@ class Peer {
   }
 
   // --- 接收 ---
-  onMsg(m) {
+  onMsg(m, via) {
     if (!m || typeof m !== 'object') return;
     switch (m.t) {
       case 'req': return this.onRequest(m);
       case 'acc': case 'rej': case 'busy': case 'done': return this.reply(m.tid, m.t);
       case 'ack':
-        if (this.out && this.out.tid === m.tid) { this.out.acked = m.bytes; this.out.wake?.(); }
+        if (this.out && this.out.tid === m.tid) { this.out.acked = m.bytes; this.out.ackAt = Date.now(); this.out.wake?.(); }
         return;
+      case 'rs': {
+        const inc = this.inc;
+        if (inc && inc.tid === m.tid) {
+          const again = inc.paused && inc.lastK === m.k;
+          inc.lastK = m.k;
+          this.offerResume(!again);
+        } else {
+          try { this.sendMsg({ t: this.doneTids.has(m.tid) ? 'done' : 'cancel', tid: m.tid }); } catch {}
+        }
+        return;
+      }
+      case 'rp': {
+        const t = this.out;
+        if (!t || t.tid !== m.tid || !(m.n > t.rpN) || t.phase === 'link' || t.phase === 'wait') return;
+        const i = m.i | 0, got = Number(m.got), f = t.files[i];
+        if (!f || !(got >= 0 && got <= f.size)) {
+          t.cancelled = true;
+          t.cancelReason = '续传位置对不上';
+          try { this.sendMsg({ t: 'cancel', tid: t.tid }); } catch {}
+          this.reply(t.tid, 'cancel');
+          t.wake?.();
+          return;
+        }
+        t.rpN = m.n;
+        t.rewind = { i, off: got, n: m.n };
+        t.hold = false;
+        t.ackAt = Date.now();
+        clearTimeout(t.rsTimer);
+        if (t.phase === 'finish') this.reply(t.tid, 'rewind');
+        t.wake?.();
+        this.paintSoon();
+        return;
+      }
       case 'cancel': {
         if (this.out && this.out.tid === m.tid) {
           this.out.cancelled = true;
@@ -411,10 +707,21 @@ class Peer {
         if (this.pendingReq && this.pendingReq.tid === m.tid) { this.pendingReq.close(); this.pendingReq = null; }
         return;
       }
-      case 'fh':
-        if (this.inc && this.inc.tid === m.tid) this.inc.cur = { i: m.i, chunks: [], got: 0 };
+      case 'fh': {
+        const inc = this.inc;
+        if (!inc || inc.tid !== m.tid) return;
+        // 暂停中只认编号对得上的续传头；正常接收中只认当前链路上的普通文件头（其余都是旧链路上迟到的）
+        if (inc.paused ? m.n !== inc.n : (m.n != null || (inc.via && via !== inc.via))) return;
+        const wantI = inc.cur ? inc.cur.i : inc.next, wantOff = inc.cur ? inc.cur.got : 0;
+        if ((m.i | 0) !== wantI || (Number(m.off) || 0) !== wantOff) return this.offerResume(true);
+        if (!inc.cur) inc.cur = { i: wantI, chunks: [], got: 0 };
+        inc.paused = false;
+        inc.via = via;
+        clearTimeout(inc.rpTimer);
+        this.paintSoon();
         return;
-      case 'fe': return this.finishFile(m);
+      }
+      case 'fe': return this.finishFile(m, via);
       case 'text':
         if (typeof m.text !== 'string') return;
         logItem({ dir: 'in', kind: 'text', text: m.text.slice(0, 100000), peer: this.name });
@@ -426,11 +733,15 @@ class Peer {
   onRequest(m) {
     const files = Array.isArray(m.files) ? m.files.slice(0, 1000) : [];
     if (!files.length) return;
+    // 对方断线恢复后会重发请求：已经在处理的同一个请求不重复弹窗
+    if (this.pendingReq && this.pendingReq.tid === m.tid) return;
+    if (this.inc && this.inc.tid === m.tid) { try { this.sendMsg({ t: 'acc', tid: m.tid }); } catch {} return; }
+    if (this.doneTids.has(m.tid)) return;
     if (this.inc || this.pendingReq) { try { this.sendMsg({ t: 'busy', tid: m.tid }); } catch {} return; }
     const accept = () => {
       this.pendingReq = null;
-      this.inc = { tid: m.tid, files, total: Number(m.total) || 0, got: 0, lastAck: 0, cur: null, saved: [], start: performance.now() };
-      try { this.sendMsg({ t: 'acc', tid: m.tid }); } catch (e) { this.inc = null; toast('接收失败：' + e.message, 'error'); }
+      this.inc = { tid: m.tid, files, total: Number(m.total) || 0, got: 0, lastAck: 0, cur: null, next: 0, paused: false, n: 0, lastK: -1, via: null, start: performance.now() };
+      try { this.sendMsg({ t: 'acc', tid: m.tid }); } catch {} // 发不出去也先收着：对方恢复后会重发请求，届时再应答
       this.paint();
     };
     const trusted = store.get('trusted', []);
@@ -455,9 +766,9 @@ class Peer {
     $('#dlgTrust', dlg.el).onchange = (e) => (remember = e.target.checked);
     this.pendingReq = { tid: m.tid, close: dlg.close };
   }
-  onBin(buf) {
+  onBin(buf, via) {
     const inc = this.inc;
-    if (!inc || !inc.cur) return;
+    if (!inc || !inc.cur || inc.paused || via !== inc.via) return;
     inc.cur.chunks.push(buf);
     inc.cur.got += buf.byteLength;
     inc.got += buf.byteLength;
@@ -467,18 +778,22 @@ class Peer {
     }
     this.paintSoon();
   }
-  finishFile(m) {
+  finishFile(m, via) {
     const inc = this.inc;
-    if (!inc || inc.tid !== m.tid || !inc.cur) return;
+    if (!inc || inc.tid !== m.tid || !inc.cur || inc.paused || via !== inc.via || inc.cur.i !== (m.i | 0)) return;
     const meta = inc.files[inc.cur.i] || { name: 'file', type: '' };
+    // 字节数对不上说明中途丢过数据：不保存残缺文件，让对方从我们实际收到的位置补发
+    if (Number.isFinite(Number(meta.size)) && inc.cur.got !== Number(meta.size)) return this.offerResume(true);
     const name = String(meta.name || 'file').replace(/[\\/:*?"<>|]/g, '_').slice(0, 200) || 'file';
     const blob = new Blob(inc.cur.chunks, { type: meta.type || 'application/octet-stream' });
+    inc.next = inc.cur.i + 1;
     inc.cur = null;
     const url = URL.createObjectURL(blob);
     download(url, name);
     logItem({ dir: 'in', kind: 'file', name, size: blob.size, peer: this.name, url });
-    if (m.i >= inc.files.length - 1) {
-      try { this.sendMsg({ t: 'ack', tid: inc.tid, bytes: inc.got }); this.sendMsg({ t: 'done', tid: inc.tid }); } catch {}
+    if (inc.next >= inc.files.length) {
+      this.doneTids.add(inc.tid);
+      try { this.sendMsg({ t: 'ack', tid: inc.tid, bytes: inc.got }); this.sendMsg({ t: 'done', tid: inc.tid }); } catch {} // 丢了也没事：对方来问时会补一个 done
       const secs = (performance.now() - inc.start) / 1000;
       toast(`已收到 ${this.name} 的 ${inc.files.length} 个文件${secs > 1 ? '（' + fmtSize(inc.got / secs) + '/s）' : ''}`, 'success');
       this.inc = null;
@@ -525,6 +840,7 @@ class Peer {
       if (e.dataTransfer.files.length) this.sendFiles(e.dataTransfer.files);
     });
     $('#peers').appendChild(el);
+    this.el = el;
     this.paint();
     return el;
   }
@@ -540,49 +856,61 @@ class Peer {
     $('.peer-name', el).textContent = this.name;
     $('.peer-dev', el).textContent = devText(info.device);
     $('.via-tag', el).hidden = !(info.via || []).every((v) => v === 'room');
-    let cls = '', txt = '', frac = 0, busy = false;
+    let cls = '', txt = '', frac = 0, busy = false, tip = '';
     const t = this.out, inc = this.inc;
+    // 走中转的传输需要双方都连着服务器；直连中的传输不受服务器连接影响
+    const viaRelay = t ? t.mode !== 'p2p' || !this.p2p : inc ? inc.via !== 'p2p' || !this.p2p : !this.p2p;
+    const down = viaRelay && (this.away ? '对方掉线，等待重连…' : !wsUp() ? '连接中断，正在重连…' : '');
     if (t) {
       busy = true;
       cls = 'run';
       if (t.phase === 'link') txt = '正在建立连接…';
       else if (t.phase === 'wait') txt = '等待对方接收…';
-      else if (t.phase === 'finish') { txt = '等待对方保存…'; frac = 1; }
       else {
-        frac = t.total ? t.sent / t.total : 1;
+        frac = t.total ? Math.min(1, t.sent / t.total) : 1;
         const secs = (performance.now() - t.start) / 1000;
-        txt = `发送中 ${Math.floor(frac * 100)}%` + (secs > 0.5 ? ` · ${fmtSize(t.sent / secs)}/s` : '');
+        if (t.hold) txt = `正在续传 ${Math.floor(frac * 100)}%…`;
+        else if (t.phase === 'finish') txt = '等待对方保存…';
+        else txt = `发送中 ${Math.floor(frac * 100)}%` + (secs > 0.5 ? ` · ${fmtSize(t.sent / secs)}/s` : '');
       }
+      if (down && t.phase !== 'link') { txt = down; cls = 'warn'; }
     } else if (inc) {
       busy = true;
       cls = 'run';
       frac = inc.total ? inc.got / inc.total : 0;
       const secs = (performance.now() - inc.start) / 1000;
-      txt = `接收中 ${Math.floor(frac * 100)}%` + (secs > 0.5 ? ` · ${fmtSize(inc.got / secs)}/s` : '');
+      txt = inc.paused ? `正在续传 ${Math.floor(frac * 100)}%…` : `接收中 ${Math.floor(frac * 100)}%` + (secs > 0.5 ? ` · ${fmtSize(inc.got / secs)}/s` : '');
+      if (down) { txt = down; cls = 'warn'; }
     } else if (this.p2p) { cls = 'ok'; txt = '直连就绪'; }
-    else if (Date.now() - this.connectStarted < P2P_WAIT && !(this.pc && this.pc.connectionState === 'failed')) { txt = '正在直连…'; }
-    else if (relayAllowed) { cls = 'warn'; txt = '经服务器中转'; }
-    else { cls = 'warn'; txt = '无法直连'; }
+    else if (down) { cls = 'warn'; txt = down; }
+    else if (!this.p2pTries && Date.now() - this.connectStarted < P2P_WAIT && !(this.pc && this.pc.connectionState === 'failed')) { txt = '正在直连…'; }
+    else if (relayAllowed) { cls = 'warn'; txt = '经服务器中转'; tip = this.p2pHint; }
+    else { cls = 'warn'; txt = '无法直连'; tip = this.p2pHint; }
     const st = $('.peer-state', el);
     st.className = 'peer-state ' + cls;
+    st.title = tip;
     st.lastElementChild.textContent = txt;
     el.classList.toggle('busy', busy);
+    el.classList.toggle('away', this.away);
     $('.ring .bar', el).style.strokeDashoffset = String(257.6 * (1 - Math.min(1, frac)));
     const acts = busy
       ? `<button class="btn btn-sm" data-act="cancel">取消</button>`
       : `<button class="btn btn-primary btn-sm" data-act="file">发送文件</button><button class="btn btn-sm" data-act="text">发文字</button>`;
     const box = $('.peer-actions', el);
-    if (box.dataset.busy !== String(busy)) { box.innerHTML = acts; box.dataset.busy = String(busy); }
+    if (box.dataset.busy !== String(busy)) { box.innerHTML = acts; box.dataset.busy = String(busy); syncWakeLock(); }
   }
   destroy(reason) {
     if (this.out) { this.out.cancelled = true; this.out.cancelReason = reason; this.reply(this.out.tid, 'cancel'); this.out.wake?.(); }
     for (const tid of [...this.waiters.keys()]) this.reply(tid, 'cancel');
     if (this.inc) toast(`${this.name}：${reason}，接收中断`, 'error');
+    this.inc = null;
     if (this.pendingReq) this.pendingReq.close();
     this.queue.length = 0;
+    clearTimeout(this.p2pTimer);
     this.resetPC();
     this.el?.remove();
     this.el = null;
+    syncWakeLock();
   }
 }
 
