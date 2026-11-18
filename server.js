@@ -46,6 +46,7 @@ const server = http.createServer((req, res) => {
   try { pathname = decodeURIComponent(new URL(req.url, 'http://x').pathname); } catch { pathname = '/'; }
   if (pathname === '/healthz') { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('ok'); return; }
   if (pathname.endsWith('/')) pathname += 'index.html';
+  if (pathname === '/index.html') return sendIndex(req, res);
   const file = path.join(PUBLIC, path.normalize(pathname));
   if (!file.startsWith(PUBLIC + path.sep)) { res.writeHead(403); res.end(); return; }
   fs.stat(file, (err, st) => {
@@ -53,7 +54,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, {
       'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
       'Content-Length': st.size,
-      'Cache-Control': 'no-cache',
+      'Cache-Control': /[?&]v=/.test(req.url) ? 'public, max-age=31536000, immutable' : 'no-cache',
       'X-Content-Type-Options': 'nosniff',
       'Referrer-Policy': 'no-referrer',
     });
@@ -61,6 +62,29 @@ const server = http.createServer((req, res) => {
     fs.createReadStream(file).pipe(res);
   });
 });
+
+// 首页里的脚本和样式地址带上版本号（文件修改时间）。CDN（如 Cloudflare）会无视 no-cache 把 .js/.css 缓存几个小时，
+// 不带版本号的话，更新部署后用户拿到的还是旧脚本；首页本身不缓存，所以新地址总能立刻生效。
+const ASSETS = ['tokens.css', 'style.css', 'app.js'];
+function sendIndex(req, res) {
+  let html;
+  try {
+    html = fs.readFileSync(path.join(PUBLIC, 'index.html'), 'utf8');
+    for (const a of ASSETS) {
+      const v = Math.floor(fs.statSync(path.join(PUBLIC, a)).mtimeMs).toString(36);
+      html = html.replace(`"${a}"`, `"${a}?v=${v}"`);
+    }
+  } catch { res.writeHead(500); res.end(); return; }
+  const body = Buffer.from(html);
+  res.writeHead(200, {
+    'Content-Type': MIME['.html'],
+    'Content-Length': body.length,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+  });
+  res.end(req.method === 'HEAD' ? undefined : body);
+}
 
 // ---------- 分组 ----------
 function clientIp(req) {
@@ -166,6 +190,9 @@ function join(ws, ip, m) {
     };
     peers.set(peer.id, peer);
     addTo(net, peer);
+    // 同一浏览器刷新页面后以新身份加入：它之前那个掉线中的身份不会再回来了，立刻清掉，免得对方看到一张灰色的旧卡片
+    const key = str(m.key, 64);
+    if (key) for (const p of [...peers.values()]) if (p !== peer && p.away && p.key === key) drop(p, '同一设备已重新加入');
   }
   peer.name = str(m.name, 32) || peer.name || '匿名设备';
   peer.key = str(m.key, 64);
