@@ -31,7 +31,7 @@ kbd { font-family: var(--font); font-size: 12px; padding: 1px 6px; border-radius
 .lead { margin: 0; font-size: 15px; color: var(--text-2); line-height: 1.6; }
 
 /* 设备卡片 */
-.peers { display: grid; grid-template-columns: repeat(auto-fill, minmax(196px, 1fr)); gap: 14px; align-content: start; }
+.peers { display: grid; grid-template-columns: repeat(auto-fill, minmax(216px, 1fr)); gap: 14px; align-content: start; }
 .peer { position: relative; background: var(--panel); border-radius: var(--r-lg); box-shadow: var(--shadow-card); padding: 22px 16px 16px; display: flex; flex-direction: column; align-items: center; text-align: center; cursor: pointer; transition: transform .3s var(--ease-out), box-shadow .3s var(--ease-out), background .15s; animation: riseIn .4s var(--ease-out); outline: 2px solid transparent; outline-offset: -2px; }
 .peer:hover { transform: translateY(-3px); box-shadow: var(--shadow-lift); }
 .peer.drag { outline-color: var(--primary); background: var(--primary-soft); transform: translateY(-3px) scale(1.02); }
@@ -53,6 +53,8 @@ kbd { font-family: var(--font); font-size: 12px; padding: 1px 6px; border-radius
 .peer-state.run i { background: var(--primary); }
 .peer-state.run { color: var(--primary); }
 .peer-actions { display: flex; gap: 8px; margin-top: 14px; }
+.peer-actions .btn-sm { padding: 0 10px; }
+.peer-actions:has(> :nth-child(3)) { gap: 6px; }
 .via-tag { position: absolute; top: 12px; right: 12px; font-size: 11px; font-weight: 500; color: var(--text-3); background: var(--fill); border-radius: 99px; padding: 2px 8px; }
 
 /* 空状态 */
@@ -102,6 +104,10 @@ kbd { font-family: var(--font); font-size: 12px; padding: 1px 6px; border-radius
 /* 拖拽遮罩 */
 .drop-mask { position: fixed; inset: 0; z-index: 2000; background: rgba(0, 0, 0, .25); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center; animation: fadeIn .15s ease-out; pointer-events: none; }
 .drop-mask[hidden] { display: none; }
+/* 拖动时设备卡片浮在遮罩上面，直接拖到哪台就发给哪台 */
+body.dragging .peers { position: relative; z-index: 2001; }
+body.dragging .peer { animation: none; }
+body.dragging .drop-mask { align-items: flex-end; padding-bottom: 12vh; }
 .drop-card { background: var(--panel); border-radius: var(--r-xl); box-shadow: var(--shadow); padding: 30px 40px; display: flex; flex-direction: column; align-items: center; gap: 14px; font-size: 16px; font-weight: 600; letter-spacing: -0.02em; animation: popIn .18s ease-out; }
 .drop-ico { width: 56px; height: 56px; border-radius: 50%; background: var(--primary-soft); color: var(--primary); display: flex; align-items: center; justify-content: center; }
 

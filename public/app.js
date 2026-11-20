@@ -3,8 +3,9 @@
  * 发现：连上服务器后，服务器按出口 IP 把同一网络的设备推送过来
  * 传输：优先 WebRTC DataChannel 点对点直连；连不上时经服务器 WebSocket 中转
  * 协议（JSON 控制消息 + 二进制数据块）：
- *   req{tid,files,total} → acc/rej → [fh{i} 数据块... fe{i}]×N → done；接收方每 1MB 回 ack；任一方可 cancel
+ *   req{tid,files:[{name,size,type}|{path,size}],total} → acc/rej → [fh{i} 数据块... fe{i}]×N → done；接收方每 1MB 回 ack；任一方可 cancel
  *   text{text}
+ * 文件夹：files 里带相对路径 path，接收方收完后打包成一个 ZIP 下载
  */
 
 // ---------- 常量与工具 ----------
@@ -13,6 +14,9 @@ const READ_BLOCK = 2 * 1024 * 1024;
 const ACK_EVERY = 256 * 1024;
 const P2P_WAIT = 6000; // 发送前最多等直连这么久
 const P2P_GIVEUP = 15000; // 一次直连尝试的期限，超过就记为失败、稍后重试
+const MAX_FILES = 5000; // 一次最多发送的文件数
+const MAX_REQ = 250000; // 文件清单最大字节数（Chrome 直连单条消息上限 256KB）
+const JUNK = /^(\.DS_Store|Thumbs\.db|desktop\.ini)$/i; // 文件夹里的系统垃圾文件，不发
 
 const $ = (s, el = document) => el.querySelector(s);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -31,11 +35,121 @@ function fmtSize(n) {
 }
 const fmtTime = (d = new Date()) => d.toTimeString().slice(0, 5);
 
+// ---------- 文件夹 ----------
+// 文件在文件夹里的相对路径（拖进来的文件夹 / 选择文件夹），普通文件为空
+const relPath = (f) => f.relPath || f.webkitRelativePath || '';
+const fileMeta = (f) => {
+  const p = relPath(f);
+  return p.includes('/') ? { path: p, size: f.size } : { name: f.name, size: f.size, type: f.type };
+};
+const safeName = (s) => String(s || '').replace(/[\x00-\x1f\\/:*?"<>|]/g, '_').trim().slice(0, 200) || 'file';
+function safePath(p, fallback) {
+  const segs = String(p || '').split(/[\\/]+/).map((s) => s.replace(/[\x00-\x1f:*?"<>|]/g, '_').trim().slice(0, 120)).filter((s) => s && s !== '.' && s !== '..');
+  return segs.join('/').slice(0, 1000) || fallback;
+}
+// 这批里有文件夹时返回打包名：只有一个顶层文件夹就用它的名字，否则用时间
+function bundleName(paths) {
+  if (!paths.some((p) => p.includes('/'))) return '';
+  const tops = new Set(paths.map((p) => (p.includes('/') ? p.split('/')[0] : '')));
+  if (tops.size === 1 && !tops.has('')) return [...tops][0];
+  const d = new Date();
+  return `快传文件-${d.getMonth() + 1}月${d.getDate()}日${String(d.getHours()).padStart(2, '0')}${String(d.getMinutes()).padStart(2, '0')}`;
+}
+// 手机浏览器基本不支持选文件夹，只在电脑上显示“文件夹”按钮
+const canPickDir = !/Android|iPhone|iPad|iPod/.test(navigator.userAgent) && !(/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1)
+  && 'webkitdirectory' in document.createElement('input');
+
+const CRC_T = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c; }
+  return t;
+})();
+function crc32(u8, crc = 0) {
+  crc = ~crc;
+  for (let i = 0; i < u8.length; i++) crc = CRC_T[(crc ^ u8[i]) & 255] ^ (crc >>> 8);
+  return ~crc >>> 0;
+}
+// 打包成 ZIP：只存储不压缩，数据直接引用已收到的 Blob、不额外复制；单个文件或总量超过 4GB 时用 ZIP64
+function makeZip(entries) {
+  const enc = new TextEncoder();
+  const u64 = (dv, o, v) => { dv.setUint32(o, v % 4294967296, true); dv.setUint32(o + 4, Math.floor(v / 4294967296), true); };
+  const BIG = 0xffffffff;
+  const d = new Date();
+  const time = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  const date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  const parts = [], cds = [];
+  let off = 0;
+  for (const e of entries) {
+    const name = enc.encode(e.path), size = e.blob.size, z = size >= BIG;
+    // 本地文件头
+    const lh = new DataView(new ArrayBuffer(30 + name.length + (z ? 20 : 0)));
+    lh.setUint32(0, 0x04034b50, true);
+    lh.setUint16(4, z ? 45 : 20, true);
+    lh.setUint16(6, 0x0800, true); // 文件名是 UTF-8
+    lh.setUint16(10, time, true);
+    lh.setUint16(12, date, true);
+    lh.setUint32(14, e.crc, true);
+    lh.setUint32(18, z ? BIG : size, true);
+    lh.setUint32(22, z ? BIG : size, true);
+    lh.setUint16(26, name.length, true);
+    lh.setUint16(28, z ? 20 : 0, true);
+    new Uint8Array(lh.buffer).set(name, 30);
+    if (z) { const o = 30 + name.length; lh.setUint16(o, 1, true); lh.setUint16(o + 2, 16, true); u64(lh, o + 4, size); u64(lh, o + 12, size); }
+    parts.push(lh.buffer, e.blob);
+    // 中央目录项
+    const cz = z || off >= BIG;
+    const ch = new DataView(new ArrayBuffer(46 + name.length + (cz ? 28 : 0)));
+    ch.setUint32(0, 0x02014b50, true);
+    ch.setUint16(4, 45, true);
+    ch.setUint16(6, cz ? 45 : 20, true);
+    ch.setUint16(8, 0x0800, true);
+    ch.setUint16(12, time, true);
+    ch.setUint16(14, date, true);
+    ch.setUint32(16, e.crc, true);
+    ch.setUint32(20, cz ? BIG : size, true);
+    ch.setUint32(24, cz ? BIG : size, true);
+    ch.setUint16(28, name.length, true);
+    ch.setUint16(30, cz ? 28 : 0, true);
+    ch.setUint32(42, cz ? BIG : off, true);
+    new Uint8Array(ch.buffer).set(name, 46);
+    if (cz) { const o = 46 + name.length; ch.setUint16(o, 1, true); ch.setUint16(o + 2, 24, true); u64(ch, o + 4, size); u64(ch, o + 12, size); u64(ch, o + 20, off); }
+    cds.push(ch.buffer);
+    off += lh.byteLength + size;
+  }
+  const cdOff = off, cdSize = cds.reduce((s, b) => s + b.byteLength, 0), n = entries.length;
+  parts.push(...cds);
+  if (n >= 0xffff || cdOff >= BIG || cdSize >= BIG) {
+    // ZIP64 目录结束记录 + 定位器
+    const z = new DataView(new ArrayBuffer(76));
+    z.setUint32(0, 0x06064b50, true);
+    u64(z, 4, 44);
+    z.setUint16(12, 45, true);
+    z.setUint16(14, 45, true);
+    u64(z, 24, n);
+    u64(z, 32, n);
+    u64(z, 40, cdSize);
+    u64(z, 48, cdOff);
+    z.setUint32(56, 0x07064b50, true);
+    u64(z, 64, cdOff + cdSize);
+    z.setUint32(72, 1, true);
+    parts.push(z.buffer);
+  }
+  const eo = new DataView(new ArrayBuffer(22));
+  eo.setUint32(0, 0x06054b50, true);
+  eo.setUint16(8, Math.min(n, 0xffff), true);
+  eo.setUint16(10, Math.min(n, 0xffff), true);
+  eo.setUint32(12, Math.min(cdSize, BIG), true);
+  eo.setUint32(16, Math.min(cdOff, BIG), true);
+  parts.push(eo.buffer);
+  return new Blob(parts, { type: 'application/zip' });
+}
+
 // ---------- 图标（lucide 风格） ----------
 const P = {
   monitor: '<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>',
   phone: '<rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M11 18h2"/>',
   tablet: '<rect x="4" y="2" width="16" height="20" rx="2.5"/><path d="M11 18h2"/>',
+  folder: '<path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9l-.8-1.2A2 2 0 0 0 7.9 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"/>',
   file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>',
   text: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
   upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5M12 3v12"/>',
@@ -534,8 +648,12 @@ class Peer {
 
   // --- 发送文件 ---
   sendFiles(fileList) {
-    const files = [...fileList].filter((f) => f && typeof f.size === 'number');
-    if (!files.length) return;
+    const files = [...fileList].filter((f) => f && typeof f.size === 'number' && !(relPath(f).includes('/') && JUNK.test(f.name)));
+    if (!files.length) { toast('没有可发送的文件（文件夹是空的？）', 'error'); return; }
+    if (files.length > MAX_FILES) { toast(`文件太多（${files.length} 个，最多 ${MAX_FILES} 个），请先压缩成一个文件再发送`, 'error'); return; }
+    const metas = files.map(fileMeta);
+    if (new TextEncoder().encode(JSON.stringify(metas)).length > MAX_REQ) { toast(`文件太多（${files.length} 个），请先压缩成一个文件再发送`, 'error'); return; }
+    files.metas = metas;
     this.queue.push(files);
     if (!this.busy) this.runQueue();
     else toast(`已加入队列，当前传输完成后发送给 ${this.name}`);
@@ -559,7 +677,7 @@ class Peer {
     if (t.cancelled) throw new Error('已取消');
     t.phase = 'wait';
     this.paint();
-    t.req = { t: 'req', tid, total, files: files.map((f) => ({ name: f.name, size: f.size, type: f.type })) };
+    t.req = { t: 'req', tid, total, files: files.metas || files.map(fileMeta) };
     try { this.sendMsg(t.req); } catch {} // 恰好断线也没关系：链路恢复时 recover() 会重发
     const ans = await this.waitReply(tid);
     if (ans === 'rej') { toast(`${this.name} 拒绝了文件`, 'error'); return; }
@@ -576,7 +694,9 @@ class Peer {
     finally { clearInterval(dog); clearTimeout(t.rsTimer); }
     const secs = (performance.now() - t.start) / 1000;
     toast(`已发送给 ${this.name}（${fmtSize(total)}${secs > 1 ? '，' + fmtSize(total / secs) + '/s' : ''}）`, 'success');
-    for (const f of files) logItem({ dir: 'out', kind: 'file', name: f.name, size: f.size, peer: this.name, mode: t.mode });
+    const bundle = bundleName(files.map(relPath));
+    if (bundle) logItem({ dir: 'out', kind: 'file', folder: true, name: bundle, count: files.length, size: total, peer: this.name, mode: t.mode });
+    else for (const f of files) logItem({ dir: 'out', kind: 'file', name: f.name, size: f.size, peer: this.name, mode: t.mode });
   }
   // 发送循环：位置 (i, off) 随时可以被接收方的 rp 拨回去（t.rewind），所以断线、换链路都只是“从对方说的位置接着发”
   async pump(t) {
@@ -714,7 +834,7 @@ class Peer {
         if (inc.paused ? m.n !== inc.n : (m.n != null || (inc.via && via !== inc.via))) return;
         const wantI = inc.cur ? inc.cur.i : inc.next, wantOff = inc.cur ? inc.cur.got : 0;
         if ((m.i | 0) !== wantI || (Number(m.off) || 0) !== wantOff) return this.offerResume(true);
-        if (!inc.cur) inc.cur = { i: wantI, chunks: [], got: 0 };
+        if (!inc.cur) inc.cur = { i: wantI, chunks: [], got: 0, crc: 0 };
         inc.paused = false;
         inc.via = via;
         clearTimeout(inc.rpTimer);
@@ -731,8 +851,13 @@ class Peer {
     }
   }
   onRequest(m) {
-    const files = Array.isArray(m.files) ? m.files.slice(0, 1000) : [];
+    const files = (Array.isArray(m.files) ? m.files.slice(0, MAX_FILES) : []).map((f) => {
+      const path = f && f.path ? safePath(f.path, '') : '';
+      const name = safeName((f && f.name) || path.split('/').pop());
+      return { name, path, size: Number(f && f.size) || 0, type: String((f && f.type) || '') };
+    });
     if (!files.length) return;
+    const bundle = bundleName(files.map((f) => f.path));
     // 对方断线恢复后会重发请求：已经在处理的同一个请求不重复弹窗
     if (this.pendingReq && this.pendingReq.tid === m.tid) return;
     if (this.inc && this.inc.tid === m.tid) { try { this.sendMsg({ t: 'acc', tid: m.tid }); } catch {} return; }
@@ -740,7 +865,7 @@ class Peer {
     if (this.inc || this.pendingReq) { try { this.sendMsg({ t: 'busy', tid: m.tid }); } catch {} return; }
     const accept = () => {
       this.pendingReq = null;
-      this.inc = { tid: m.tid, files, total: Number(m.total) || 0, got: 0, lastAck: 0, cur: null, next: 0, paused: false, n: 0, lastK: -1, via: null, start: performance.now() };
+      this.inc = { tid: m.tid, files, bundle, saved: [], total: Number(m.total) || 0, got: 0, lastAck: 0, cur: null, next: 0, paused: false, n: 0, lastK: -1, via: null, start: performance.now() };
       try { this.sendMsg({ t: 'acc', tid: m.tid }); } catch {} // 发不出去也先收着：对方恢复后会重发请求，届时再应答
       this.paint();
     };
@@ -751,8 +876,10 @@ class Peer {
     let remember = false;
     const dlg = openModal({
       title: '收到文件',
-      body: `<div class="modal-sub"><b>${esc(this.name)}</b> 想发送 ${files.length} 个文件，共 ${fmtSize(total)}</div>
-        <div class="file-list">${files.slice(0, 50).map((f) => `<div class="file-row"><span>${esc(f.name)}</span><span>${fmtSize(Number(f.size) || 0)}</span></div>`).join('')}${files.length > 50 ? `<div class="file-row"><span>……还有 ${files.length - 50} 个</span><span></span></div>` : ''}</div>
+      body: `<div class="modal-sub">${bundle
+          ? `<b>${esc(this.name)}</b> 想发送文件夹 <b>${esc(bundle)}</b>（${files.length} 个文件，共 ${fmtSize(total)}），收完后打包成 ZIP 下载`
+          : `<b>${esc(this.name)}</b> 想发送 ${files.length} 个文件，共 ${fmtSize(total)}`}</div>
+        <div class="file-list">${files.slice(0, 50).map((f) => `<div class="file-row"><span title="${esc(f.path || f.name)}">${esc(f.path || f.name)}</span><span>${fmtSize(Number(f.size) || 0)}</span></div>`).join('')}${files.length > 50 ? `<div class="file-row"><span>……还有 ${files.length - 50} 个</span><span></span></div>` : ''}</div>
         <label class="form-check modal-tip"><input type="checkbox" id="dlgTrust"> 以后自动接收这台设备的文件</label>`,
       buttons: [
         { label: '拒绝', onClick: () => { this.pendingReq = null; try { this.sendMsg({ t: 'rej', tid: m.tid }); } catch {} } },
@@ -771,6 +898,7 @@ class Peer {
     if (!inc || !inc.cur || inc.paused || via !== inc.via) return;
     inc.cur.chunks.push(buf);
     inc.cur.got += buf.byteLength;
+    if (inc.bundle) inc.cur.crc = crc32(new Uint8Array(buf), inc.cur.crc);
     inc.got += buf.byteLength;
     if (inc.got - inc.lastAck >= ACK_EVERY) {
       inc.lastAck = inc.got;
@@ -784,18 +912,30 @@ class Peer {
     const meta = inc.files[inc.cur.i] || { name: 'file', type: '' };
     // 字节数对不上说明中途丢过数据：不保存残缺文件，让对方从我们实际收到的位置补发
     if (Number.isFinite(Number(meta.size)) && inc.cur.got !== Number(meta.size)) return this.offerResume(true);
-    const name = String(meta.name || 'file').replace(/[\\/:*?"<>|]/g, '_').slice(0, 200) || 'file';
+    const name = safeName(meta.name);
     const blob = new Blob(inc.cur.chunks, { type: meta.type || 'application/octet-stream' });
+    // 文件夹：先攒着，全部收完再打包成一个 ZIP（逐个下载会被浏览器拦成“下载多个文件”，也丢了目录结构）
+    if (inc.bundle) inc.saved.push({ path: meta.path || name, blob, crc: inc.cur.crc });
     inc.next = inc.cur.i + 1;
     inc.cur = null;
-    const url = URL.createObjectURL(blob);
-    download(url, name);
-    logItem({ dir: 'in', kind: 'file', name, size: blob.size, peer: this.name, url });
+    if (!inc.bundle) {
+      const url = URL.createObjectURL(blob);
+      download(url, name);
+      logItem({ dir: 'in', kind: 'file', name, size: blob.size, peer: this.name, url });
+    }
     if (inc.next >= inc.files.length) {
       this.doneTids.add(inc.tid);
       try { this.sendMsg({ t: 'ack', tid: inc.tid, bytes: inc.got }); this.sendMsg({ t: 'done', tid: inc.tid }); } catch {} // 丢了也没事：对方来问时会补一个 done
       const secs = (performance.now() - inc.start) / 1000;
-      toast(`已收到 ${this.name} 的 ${inc.files.length} 个文件${secs > 1 ? '（' + fmtSize(inc.got / secs) + '/s）' : ''}`, 'success');
+      const speed = secs > 1 ? '（' + fmtSize(inc.got / secs) + '/s）' : '';
+      if (inc.bundle) {
+        const zip = makeZip(inc.saved);
+        const zname = safeName(inc.bundle) + '.zip';
+        const url = URL.createObjectURL(zip);
+        download(url, zname);
+        logItem({ dir: 'in', kind: 'file', folder: true, name: zname, count: inc.files.length, size: inc.got, peer: this.name, url });
+        toast(`已收到 ${this.name} 的文件夹，共 ${inc.files.length} 个文件，已打包为 ZIP${speed}`, 'success');
+      } else toast(`已收到 ${this.name} 的 ${inc.files.length} 个文件${speed}`, 'success');
       this.inc = null;
       notifyTitle();
     }
@@ -827,17 +967,8 @@ class Peer {
       const b = e.target.closest('button');
       if (b?.dataset.act === 'text') return textDialog(this);
       if (b?.dataset.act === 'cancel') return this.out ? this.cancel() : this.cancelIncoming();
+      if (b?.dataset.act === 'dir') return pickFiles(this, true);
       if (b?.dataset.act === 'file' || !b) { if (!this.out && !this.inc) pickFiles(this); }
-    });
-    el.addEventListener('dragenter', (e) => { if (hasFiles(e)) { e.preventDefault(); el.classList.add('drag'); } });
-    el.addEventListener('dragover', (e) => { if (hasFiles(e)) { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'copy'; el.classList.add('drag'); hideMask(); } });
-    el.addEventListener('dragleave', (e) => { if (!el.contains(e.relatedTarget)) el.classList.remove('drag'); });
-    el.addEventListener('drop', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      el.classList.remove('drag');
-      hideMask();
-      if (e.dataTransfer.files.length) this.sendFiles(e.dataTransfer.files);
     });
     $('#peers').appendChild(el);
     this.el = el;
@@ -895,7 +1026,7 @@ class Peer {
     $('.ring .bar', el).style.strokeDashoffset = String(257.6 * (1 - Math.min(1, frac)));
     const acts = busy
       ? `<button class="btn btn-sm" data-act="cancel">取消</button>`
-      : `<button class="btn btn-primary btn-sm" data-act="file">发送文件</button><button class="btn btn-sm" data-act="text">发文字</button>`;
+      : `<button class="btn btn-primary btn-sm" data-act="file">发文件</button>${canPickDir ? '<button class="btn btn-sm" data-act="dir">文件夹</button>' : ''}<button class="btn btn-sm" data-act="text">发文字</button>`;
     const box = $('.peer-actions', el);
     if (box.dataset.busy !== String(busy)) { box.innerHTML = acts; box.dataset.busy = String(busy); syncWakeLock(); }
   }
@@ -1000,9 +1131,9 @@ function logItem(it) {
   const who = it.dir === 'in' ? `来自 ${esc(it.peer)}` : `发给 ${esc(it.peer)}`;
   const via = it.mode === 'relay' ? ' · 中转' : '';
   if (it.kind === 'file') {
-    el.innerHTML = `<div class="item-ico">${icon('file', 17)}</div><div class="item-main">
+    el.innerHTML = `<div class="item-ico">${icon(it.folder ? 'folder' : 'file', 17)}</div><div class="item-main">
       <div class="item-title" title="${esc(it.name)}">${esc(it.name)}</div>
-      <div class="item-meta">${fmtSize(it.size)} · ${who} · ${fmtTime()}${via}</div>
+      <div class="item-meta">${it.count ? it.count + ' 个文件 · ' : ''}${fmtSize(it.size)} · ${who} · ${fmtTime()}${via}</div>
       ${it.url ? `<div class="item-actions"><button class="btn btn-sm" data-a="dl">再次下载</button></div>` : ''}</div>`;
     if (it.url) { logUrls.push(it.url); $('[data-a=dl]', el).onclick = () => download(it.url, it.name); }
   } else {
@@ -1026,16 +1157,22 @@ $('#btnClear').onclick = () => {
 
 // ---------- 发送入口 ----------
 let pickTarget = null;
-function pickFiles(peer) {
+function pickFiles(peer, dir = false) {
   pickTarget = peer;
-  const inp = $('#filePick');
+  const inp = $(dir ? '#dirPick' : '#filePick');
   inp.value = '';
   inp.click();
 }
-$('#filePick').onchange = (e) => {
-  if (pickTarget && peers.get(pickTarget.id) === pickTarget) pickTarget.sendFiles(e.target.files);
-  pickTarget = null;
-};
+for (const sel of ['#filePick', '#dirPick']) {
+  $(sel).onchange = (e) => {
+    const files = [...e.target.files];
+    if (pickTarget && peers.get(pickTarget.id) === pickTarget) {
+      if (files.length) pickTarget.sendFiles(files);
+      else if (sel === '#dirPick') toast('这个文件夹是空的', 'error');
+    }
+    pickTarget = null;
+  };
+}
 
 function textDialog(peer, initial = '') {
   openModal({
@@ -1053,32 +1190,87 @@ function textDialog(peer, initial = '') {
   });
 }
 
-const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
 const onlyPeer = () => (peers.size === 1 ? [...peers.values()][0] : null);
 
-// 整页拖拽：只有一台设备时，拖到任意位置即发送
-let maskTimer = null;
-function hideMask() { $('#dropMask').hidden = true; }
+// ---------- 拖拽发送 ----------
+// 文件、文件夹、选中的文字或链接都能拖。拖动时页面变暗、设备卡片浮在上面：
+// 拖到哪台设备上就发给哪台；只有一台设备时，松在页面任意位置都发给它。
+let innerDrag = false; // 页面内自己的拖动（比如拖记录里的文字），不当成发送
+document.addEventListener('dragstart', () => (innerDrag = true));
+document.addEventListener('dragend', () => (innerDrag = false));
+function dragKind(e) {
+  if (innerDrag) return '';
+  const ty = [...(e.dataTransfer?.types || [])];
+  return ty.includes('Files') ? 'files' : ty.includes('text/plain') || ty.includes('text/uri-list') ? 'text' : '';
+}
+function dropTarget(e) {
+  const card = e.target.closest?.('.peer');
+  return (card && [...peers.values()].find((p) => p.el === card)) || onlyPeer();
+}
+let dragTimer = null;
+let dragCard = null;
+function endDrag() {
+  clearTimeout(dragTimer);
+  document.body.classList.remove('dragging');
+  $('#dropMask').hidden = true;
+  dragCard?.classList.remove('drag');
+  dragCard = null;
+}
 document.addEventListener('dragover', (e) => {
-  if (!hasFiles(e)) return;
+  const kind = dragKind(e);
+  if (!kind) return;
   e.preventDefault();
-  const p = onlyPeer();
+  const p = dropTarget(e);
   e.dataTransfer.dropEffect = p ? 'copy' : 'none';
-  if (p || peers.size === 0) {
-    $('#dropText').textContent = p ? `松开即可发送给 ${p.name}` : '还没有发现其他设备';
-    $('#dropMask').hidden = false;
-  }
-  clearTimeout(maskTimer);
-  maskTimer = setTimeout(hideMask, 150);
+  $('#dropText').textContent = p ? `松开即可${kind === 'text' ? '把文字' : ''}发送给 ${p.name}` : peers.size ? '拖到要发送的设备上' : '还没有发现其他设备';
+  $('#dropMask').hidden = false;
+  document.body.classList.add('dragging');
+  if (dragCard !== (p?.el || null)) { dragCard?.classList.remove('drag'); dragCard = p?.el || null; dragCard?.classList.add('drag'); }
+  clearTimeout(dragTimer);
+  dragTimer = setTimeout(endDrag, 200); // 拖出窗口或按 Esc 取消时没有事件，靠这个收尾
 });
 document.addEventListener('drop', (e) => {
-  if (!hasFiles(e)) return;
+  const kind = dragKind(e);
+  if (!kind) return;
   e.preventDefault();
-  hideMask();
-  const p = onlyPeer();
-  if (p && e.dataTransfer.files.length) p.sendFiles(e.dataTransfer.files);
-  else if (peers.size > 1) toast('有多台设备，请把文件拖到具体的设备上');
+  const p = dropTarget(e);
+  endDrag();
+  if (!p) { toast(peers.size ? '有多台设备，请拖到具体的设备上' : '还没有发现其他设备'); return; }
+  if (kind === 'text') {
+    const text = e.dataTransfer.getData('text/plain') || e.dataTransfer.getData('text/uri-list');
+    if (text.trim()) textDialog(p, text);
+    return;
+  }
+  collectDrop(e.dataTransfer).then((files) => p.sendFiles(files)).catch((err) => toast(err.message || '读取文件失败', 'error'));
 });
+
+// 拖进来的可能有文件夹：顺着目录树把里面的文件都找出来，带上相对路径
+async function collectDrop(dt) {
+  // 这两样必须在 drop 事件里同步取，await 之后就拿不到了
+  const entries = [...(dt.items || [])].filter((i) => i.kind === 'file').map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
+  const loose = [...dt.files];
+  if (!entries.some((en) => en.isDirectory)) return loose;
+  const out = [];
+  const slow = setTimeout(() => toast('正在读取文件夹…'), 500);
+  try { for (const en of entries) await walkEntry(en, out); }
+  finally { clearTimeout(slow); }
+  return out;
+}
+async function walkEntry(en, out) {
+  if (out.length > MAX_FILES) throw new Error(`文件超过 ${MAX_FILES} 个，请先压缩成一个文件再发送`);
+  if (en.isFile) {
+    const f = await new Promise((res, rej) => en.file(res, rej));
+    f.relPath = en.fullPath.replace(/^\/+/, '');
+    out.push(f);
+  } else if (en.isDirectory) {
+    const rd = en.createReader();
+    for (;;) {
+      const batch = await new Promise((res, rej) => rd.readEntries(res, rej)); // 每次最多返回 100 个，要读到空为止
+      if (!batch.length) break;
+      for (const c of batch) await walkEntry(c, out);
+    }
+  }
+}
 
 // 粘贴：Ctrl+V 文件直接发送，文字弹出发送框
 document.addEventListener('paste', (e) => {
